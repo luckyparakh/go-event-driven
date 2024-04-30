@@ -2,5 +2,10 @@ go 1.22.0
 
 use (
 	./02-async/01-goroutines
+	./03-message-broker/02-publishing-messages
+	./03-message-broker/03-subscribing
+	./03-message-broker/04-nack
+	./03-message-broker/05-consumer-groups
+	./04-router/01-handlers
 	./project
 )

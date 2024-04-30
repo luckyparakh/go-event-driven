@@ -11,7 +11,11 @@ import (
 	"github.com/ThreeDotsLabs/go-event-driven/common/clients/spreadsheets"
 	commonHTTP "github.com/ThreeDotsLabs/go-event-driven/common/http"
 	"github.com/ThreeDotsLabs/go-event-driven/common/log"
+	"github.com/ThreeDotsLabs/watermill"
+	"github.com/ThreeDotsLabs/watermill-redisstream/pkg/redisstream"
+	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/labstack/echo/v4"
+	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 )
 
@@ -19,19 +23,75 @@ type TicketsConfirmationRequest struct {
 	Tickets []string `json:"tickets"`
 }
 
+const (
+	topicReceipt = "issue-receipt"
+	topicTracker = "append-to-tracker"
+)
+
 func main() {
 	log.Init(logrus.InfoLevel)
+	logger := watermill.NewStdLogger(false, false)
 
 	clients, err := clients.NewClients(os.Getenv("GATEWAY_ADDR"), nil)
 	if err != nil {
 		panic(err)
 	}
 
-	receiptsClient := NewReceiptsClient(clients)
-	spreadsheetsClient := NewSpreadsheetsClient(clients)
-	worker := NewWorker(receiptsClient, spreadsheetsClient)
+	rdb := redis.NewClient(&redis.Options{
+		Addr: os.Getenv("REDIS_ADDR"),
+	})
 
-	go worker.Run()
+	publisher, err := redisstream.NewPublisher(redisstream.PublisherConfig{
+		Client: rdb,
+	}, logger)
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		spreadsheetsClient := NewSpreadsheetsClient(clients)
+		trackerSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
+			Client:        rdb,
+			ConsumerGroup: "trackers",
+		}, logger)
+		if err != nil {
+			panic(err)
+		}
+		ctx := context.Background()
+		ch, err := trackerSub.Subscribe(ctx, topicTracker)
+		if err != nil {
+			panic(err)
+		}
+		for m := range ch {
+			if err := spreadsheetsClient.AppendRow(ctx, "tickets-to-print", []string{string(m.Payload)}); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
+		}
+	}()
+
+	go func() {
+		receiptSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
+			Client:        rdb,
+			ConsumerGroup: "receivers",
+		}, logger)
+		if err != nil {
+			panic(err)
+		}
+		receiptsClient := NewReceiptsClient(clients)
+		ctx := context.Background()
+		ch, err := receiptSub.Subscribe(ctx, topicReceipt)
+		if err != nil {
+			panic(err)
+		}
+		for m := range ch {
+			if err := receiptsClient.IssueReceipt(ctx, string(m.Payload)); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
+		}
+	}()
 	e := commonHTTP.NewEcho()
 
 	e.POST("/tickets-confirmation", func(c echo.Context) error {
@@ -42,18 +102,15 @@ func main() {
 		}
 
 		for _, ticket := range request.Tickets {
-			worker.Send(
-				Message{
-					task:     TaskAddInSheet,
-					ticketID: ticket,
-				},
-			)
-			worker.Send(
-				Message{
-					task:     TaskIssueReceipt,
-					ticketID: ticket,
-				},
-			)
+			publisher.Publish(topicTracker, &message.Message{
+				UUID:    watermill.NewShortUUID(),
+				Payload: []byte(ticket),
+			})
+
+			publisher.Publish(topicReceipt, &message.Message{
+				UUID:    watermill.NewShortUUID(),
+				Payload: []byte(ticket),
+			})
 		}
 
 		return c.NoContent(http.StatusOK)
@@ -127,8 +184,8 @@ const (
 )
 
 type Message struct {
-	task     Task
-	ticketID string
+	Task     Task
+	TicketID string
 }
 type Worker struct {
 	ch                 chan Message
@@ -149,17 +206,17 @@ func (w *Worker) Send(m Message) {
 func (w *Worker) Run() {
 	cts := context.Background()
 	for msg := range w.ch {
-		switch msg.task {
+		switch msg.Task {
 		case TaskIssueReceipt:
 			logrus.Debug("Issuing Receipt")
-			err := w.receiptsClient.IssueReceipt(cts, msg.ticketID)
+			err := w.receiptsClient.IssueReceipt(cts, msg.TicketID)
 			if err != nil {
 				logrus.WithError(err).Errorf("Error while issuing Receipt")
 				w.Send(msg)
 			}
 		case TaskAddInSheet:
 			logrus.Debug("Adding in Sheet")
-			err := w.spreadsheetsClient.AppendRow(cts, "tickets-to-print", []string{msg.ticketID})
+			err := w.spreadsheetsClient.AppendRow(cts, "tickets-to-print", []string{msg.TicketID})
 			if err != nil {
 				logrus.WithError(err).Errorf("Error while adding in Sheet")
 				w.Send(msg)
