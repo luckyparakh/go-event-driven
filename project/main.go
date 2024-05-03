@@ -41,12 +41,6 @@ func main() {
 		Addr: os.Getenv("REDIS_ADDR"),
 	})
 
-	publisher, err := redisstream.NewPublisher(redisstream.PublisherConfig{
-		Client: rdb,
-	}, logger)
-	if err != nil {
-		panic(err)
-	}
 	go func() {
 		spreadsheetsClient := NewSpreadsheetsClient(clients)
 		trackerSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
@@ -93,6 +87,13 @@ func main() {
 		}
 	}()
 	e := commonHTTP.NewEcho()
+
+	publisher, err := redisstream.NewPublisher(redisstream.PublisherConfig{
+		Client: rdb,
+	}, logger)
+	if err != nil {
+		panic(err)
+	}
 
 	e.POST("/tickets-confirmation", func(c echo.Context) error {
 		var request TicketsConfirmationRequest
@@ -174,53 +175,4 @@ func (c SpreadsheetsClient) AppendRow(ctx context.Context, spreadsheetName strin
 	}
 
 	return nil
-}
-
-type Task int
-
-const (
-	TaskIssueReceipt Task = iota
-	TaskAddInSheet
-)
-
-type Message struct {
-	Task     Task
-	TicketID string
-}
-type Worker struct {
-	ch                 chan Message
-	receiptsClient     ReceiptsClient
-	spreadsheetsClient SpreadsheetsClient
-}
-
-func NewWorker(receiptsClient ReceiptsClient, spreadsheetsClient SpreadsheetsClient) Worker {
-	return Worker{
-		ch:                 make(chan Message, 100),
-		receiptsClient:     receiptsClient,
-		spreadsheetsClient: spreadsheetsClient,
-	}
-}
-func (w *Worker) Send(m Message) {
-	w.ch <- m
-}
-func (w *Worker) Run() {
-	cts := context.Background()
-	for msg := range w.ch {
-		switch msg.Task {
-		case TaskIssueReceipt:
-			logrus.Debug("Issuing Receipt")
-			err := w.receiptsClient.IssueReceipt(cts, msg.TicketID)
-			if err != nil {
-				logrus.WithError(err).Errorf("Error while issuing Receipt")
-				w.Send(msg)
-			}
-		case TaskAddInSheet:
-			logrus.Debug("Adding in Sheet")
-			err := w.spreadsheetsClient.AppendRow(cts, "tickets-to-print", []string{msg.TicketID})
-			if err != nil {
-				logrus.WithError(err).Errorf("Error while adding in Sheet")
-				w.Send(msg)
-			}
-		}
-	}
 }

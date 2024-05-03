@@ -36,7 +36,18 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-
+	router.AddHandler(
+		"ctoF",
+		"temperature-celsius",
+		sub,
+		"temperature-fahrenheit",
+		pub,
+		func(msg *message.Message) ([]*message.Message, error) {
+			f, err := celsiusToFahrenheit(string(msg.Payload))
+			newMsg := message.NewMessage(watermill.NewShortUUID(), []byte(f))
+			return []*message.Message{newMsg}, err
+		},
+	)
 	err = router.Run(context.Background())
 	if err != nil {
 		panic(err)
